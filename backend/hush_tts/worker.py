@@ -22,6 +22,16 @@ def dispatch(request, engine):
         if not isinstance(clean, bool):
             raise ValueError("clean must be a boolean")
         return prepare(request.get("text", ""), clean)
+    if op == "warmup":
+        engine.load()
+        return {"ready": True}
+    if op == "stream_start":
+        return engine.start_stream(request.get("text", ""), request.get("voice", "af_heart"))
+    if op == "stream_next":
+        return engine.next_stream()
+    if op == "stream_cancel":
+        engine.stream = None
+        return {"done": True}
     if op == "synthesize":
         return engine.synthesize(request.get("text", ""), request.get("voice", "af_heart"))
     raise ValueError("Unknown worker operation")

@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass
 from .alignment import word_matches
 
 MAX_TEXT = 100_000
-MAX_CHUNK = 260
+MAX_CHUNK = 1000
 NOISE = re.compile(
     r"^(?:skip to (?:main )?content|accept (?:all )?cookies|reject (?:all )?cookies|"
     r"manage (?:cookies|preferences)|cookie (?:settings|policy)|advertisement|"
@@ -88,6 +88,19 @@ def prepare(text: str, clean: bool = True) -> dict:
     offsets = [0]
     for char in text:
         offsets.append(offsets[-1] + (2 if ord(char) > 0xFFFF else 1))
+    # Browser AX trees may split a reference into "[", "52", "]" on
+    # separate lines. Mask across the full input before line parsing. Keep
+    # indices intact so the surviving words still point at their source.
+    reading_text = text
+    if clean:
+        reference = re.compile(r"\[[\s\u200b-\u200d\ufeff]*\d+(?:[\s\u200b-\u200d\ufeff]*[,;–—-][\s\u200b-\u200d\ufeff]*\d+)*[\s\u200b-\u200d\ufeff]*\]")
+        masked = list(text)
+        for match in reference.finditer(text):
+            # Leave linked reference markup to the link-removal rule below.
+            if text[match.end():].startswith("("):
+                continue
+            masked[match.start():match.end()] = " " * (match.end() - match.start())
+        reading_text = "".join(masked)
     segments: list[Segment] = []
     skipped = 0
     source_index = 0
@@ -106,7 +119,7 @@ def prepare(text: str, clean: bool = True) -> dict:
                                         offsets[chunk[0][1]], offsets[chunk[-1][1] + 1], pending_kind, words))
         pending = []
 
-    for raw in text.splitlines(keepends=True):
+    for raw in reading_text.splitlines(keepends=True):
         chars = [(c, source_index + i) for i, c in enumerate(raw)]
         source_index += len(raw)
         line = raw.strip()
@@ -171,11 +184,12 @@ def prepare(text: str, clean: bool = True) -> dict:
             skipped += 1
             continue
         # Join soft-wrapped prose, preserving headings, list items and table rows.
-        # A complete sentence or a short standalone label remains its own block.
+        # Inline links can appear as short soft-wrapped lines. Blank lines and
+        # explicit heading/list/table kinds preserve real block boundaries.
         continuation = (kind == "paragraph" and pending and
                         pending_kind in {"paragraph", "bullet"} and
                         not re.search(r'[.!?:][”’"\)]*\s*$', "".join(c for c, _ in pending)) and
-                        (len(pending) >= 45 or (pending_kind == "bullet" and raw[:1].isspace())))
+                        (pending_kind == "paragraph" or raw[:1].isspace()))
         if continuation:
             if pending[-1][0] != " ":
                 pending.append((" ", max(0, collapsed[0][1] - 1)))

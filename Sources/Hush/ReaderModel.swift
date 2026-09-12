@@ -3,7 +3,7 @@ import AVFoundation
 import Combine
 
 @MainActor
-final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
+final class ReaderModel: NSObject, ObservableObject {
     @Published var segments: [ReadingSegment] = []
     @Published var currentIndex = 0
     @Published var source = "Your reading, uninterrupted."
@@ -37,7 +37,7 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
     @Published var speed = UserDefaults.standard.object(forKey: "speed") as? Double ?? 1.0 {
         didSet {
-            player?.rate = Float(speed)
+            audio.rate = speed
             UserDefaults.standard.set(speed, forKey: "speed")
         }
     }
@@ -53,10 +53,17 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private let backend = Backend()
     private let highlighter = SourceHighlighter()
     private let wordHighlighter = SourceHighlighter(isWord: true)
-    private var wordTimings: [WordTiming] = []
+    private struct PlayingWord {
+        let segment: Int
+        let word: Int
+        let start: Double
+        let end: Double
+    }
+    private let audio = PCMStreamPlayer()
+    private var playingWords: [PlayingWord] = []
+    private var wordCursor = 0
+    private var nextSynthesisIndex = 0
     private var document: CapturedDocument?
-    private var player: AVAudioPlayer?
-    private var clips: [Int: Task<AudioClip, Error>] = [:]
     private var readingTask: Task<Void, Never>?
     private var generation = UUID()
     private var playbackToken = UUID()
@@ -69,6 +76,7 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     private var pendingTail = ""
     private var tailChangedAt = Date.distantPast
     private var followFailures = 0
+    private var followError: String?
     var targetApp: NSRunningApplication?
 
     var current: ReadingSegment? { segments.indices.contains(currentIndex) ? segments[currentIndex] : nil }
@@ -76,7 +84,9 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     override init() {
         super.init()
-        speed = min(1.5, max(1, speed))
+        speed = min(2, max(1, speed))
+        audio.rate = speed
+        audio.onDrained = { [weak self] in self?.audioDrained() }
         targetApp = NSWorkspace.shared.frontmostApplication
         highlighter.onAvailability = { [weak self] available in
             if self?.sourceIsHighlighted != available { self?.sourceIsHighlighted = available }
@@ -95,7 +105,10 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             modelReady = result.ready
             if !voices.contains(where: { $0.id == voiceID }) { voiceID = voices.first?.id ?? "af_heart" }
             if !modelReady { error = "Download the local voices by running scripts/setup.sh in the project, then click Retry setup." }
-            else { error = nil }
+            else {
+                error = nil
+                _ = try await backend.request(["op": "warmup"], as: WarmupStatus.self)
+            }
         } catch { self.error = error.localizedDescription }
     }
 
@@ -198,26 +211,22 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     func togglePlayback() {
         if wantsPlayback {
             wantsPlayback = false
-            player?.pause()
+            audio.pause()
             isPlaying = false
             status = "Paused"
             highlighter.hide(); wordHighlighter.hide()
-        } else if let player, player.currentTime < player.duration - 0.05 {
+        } else if audio.hasAudio || readingTask != nil || nextSynthesisIndex < segments.count {
             wantsPlayback = true
-            isPlaying = player.play()
-            status = "Reading locally"
-            updateHighlight()
-        } else if isFollowing, !busy, progress >= 1 {
+            audio.play()
+            isPlaying = audio.isPlaying
+            status = isPlaying ? "Reading locally" : "Buffering audio…"
+            pumpAudio()
+        } else if isFollowing {
             wantsPlayback = true
-            if currentIndex + 1 < segments.count {
-                currentIndex += 1
-                playCurrent()
-            } else {
-                status = "Waiting for new text…"
-                lastFollowPoll = .distantPast
-            }
+            status = "Waiting for new text…"
+            lastFollowPoll = .distantPast
         } else if !segments.isEmpty {
-            if progress >= 1 { currentIndex = 0 }
+            currentIndex = 0
             wantsPlayback = true
             playCurrent()
         } else {
@@ -231,18 +240,17 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         playbackToken = UUID()
         readingTask?.cancel()
         readingTask = nil
-        clips.values.forEach { $0.cancel() }
-        clips.removeAll()
-        player?.stop()
-        player = nil
+        audio.reset()
+        playingWords = []
+        wordCursor = 0
+        nextSynthesisIndex = 0
         wantsPlayback = false
         isPlaying = false
         busy = false
         progress = 0
         status = "Stopped"
         highlighter.hide(); wordHighlighter.hide()
-        // Kill pending synthesis so an old document never delays a new selection.
-        backend.reset()
+        backend.cancelStream()
     }
 
     func clear() {
@@ -272,12 +280,14 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
 
     private func changeVoice() {
         let resume = wantsPlayback
-        let waiting = isFollowing && player == nil && progress >= 1
+        let waiting = isFollowing && !audio.hasAudio && readingTask == nil && progress >= 1
         let sourceToFollow = followSource
         stop()
         followSource = sourceToFollow
         isFollowing = sourceToFollow != nil
+        nextSynthesisIndex = currentIndex
         if waiting {
+            nextSynthesisIndex = segments.count
             wantsPlayback = resume
             progress = 1
             status = resume ? "Waiting for new text…" : "Paused"
@@ -289,88 +299,111 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         }
     }
 
-    private func clip(at index: Int) -> Task<AudioClip, Error> {
-        if let existing = clips[index] { return existing }
-        let text = segments[index].text
-        let voice = voiceID
-        let task = Task { try await backend.request(["op": "synthesize", "text": text, "voice": voice], as: AudioClip.self) }
-        clips[index] = task
-        return task
-    }
-
     private func playCurrent() {
         guard current != nil else { return }
-        sourceHighlightChecked = false
-        wordTimings = []
-        wordHighlighter.hide()
-        let index = currentIndex
-        let token = UUID()
-        playbackToken = token
+        playbackToken = UUID()
         readingTask?.cancel()
-        player?.stop()
-        player = nil
-        isPlaying = false
+        readingTask = nil
+        backend.cancelStream()
+        audio.reset()
+        playingWords = []
+        wordCursor = 0
+        nextSynthesisIndex = currentIndex
+        sourceHighlightChecked = false
         highlighter.hide(); wordHighlighter.hide()
-        progress = Double(index) / Double(max(1, segments.count))
+        isPlaying = false
         busy = true
         status = "Preparing voice…"
         error = nil
-        let nextClip = clip(at: index)
+        progress = Double(currentIndex) / Double(max(1, segments.count))
+        pumpAudio()
+    }
+
+    private func pumpAudio() {
+        guard readingTask == nil, nextSynthesisIndex < segments.count else { return }
+        let token = playbackToken
+        let voice = voiceID
         readingTask = Task {
             do {
-                let audio = try await nextClip.value
-                guard playbackToken == token, !Task.isCancelled else { return }
-                guard let data = Data(base64Encoded: audio.audio) else { throw HushError(message: "The voice returned invalid audio.") }
-                let nextPlayer = try AVAudioPlayer(data: data)
-                nextPlayer.enableRate = true
-                nextPlayer.rate = Float(speed)
-                nextPlayer.delegate = self
-                nextPlayer.prepareToPlay()
-                player = nextPlayer
-                wordTimings = audio.words ?? []
-                busy = false
-                if wantsPlayback {
-                    guard nextPlayer.play() else { throw HushError(message: "Could not start audio. Check your Mac's sound output.") }
-                    isPlaying = true
-                    status = "Reading locally"
-                    updateHighlight()
-                } else { status = "Paused" }
-                // Keep only the current and following sentence's audio in memory.
-                clips = clips.filter { $0.key == index || $0.key == index + 1 }
-                if segments.indices.contains(index + 1) { _ = clip(at: index + 1) }
+                while nextSynthesisIndex < segments.count {
+                    try Task.checkCancellation()
+                    guard token == playbackToken else { return }
+                    // Roughly twelve seconds of listening reserve, including at
+                    // 2x. Pulling the next window supplies explicit backpressure.
+                    while audio.bufferedDuration > 12 * speed || !wantsPlayback {
+                        try await Task.sleep(for: .milliseconds(100))
+                        try Task.checkCancellation()
+                        guard token == playbackToken else { return }
+                    }
+                    var text = ""
+                    var bindings: [(segment: Int, word: Int)] = []
+                    var end = nextSynthesisIndex
+                    while end < segments.count {
+                        let segment = segments[end]
+                        if !text.isEmpty && text.count + segment.text.count > 1800 { break }
+                        if !text.isEmpty { text += " " }
+                        text += segment.text
+                        for index in (segment.words ?? []).indices { bindings.append((end, index)) }
+                        end += 1
+                    }
+                    let base = audio.scheduledEnd
+                    var first = true
+                    while true {
+                        while audio.bufferedDuration > 12 * speed || !wantsPlayback {
+                            try await Task.sleep(for: .milliseconds(100))
+                            try Task.checkCancellation()
+                        }
+                        guard token == playbackToken else { return }
+                        let request: [String: Any] = first ? ["op": "stream_start", "text": text, "voice": voice] : ["op": "stream_next"]
+                        let chunk = try await backend.request(request, as: PCMChunk.self)
+                        try Task.checkCancellation()
+                        guard token == playbackToken else { return }
+                        first = false
+                        for timing in chunk.words ?? [] where bindings.indices.contains(timing.index) {
+                            let binding = bindings[timing.index]
+                            playingWords.append(PlayingWord(segment: binding.segment, word: binding.word,
+                                                            start: base + timing.start, end: base + timing.end))
+                        }
+                        if chunk.pcm != nil {
+                            try audio.append(chunk)
+                            busy = false
+                            if wantsPlayback { audio.play() }
+                            isPlaying = audio.isPlaying
+                            status = wantsPlayback ? "Reading locally" : "Paused"
+                        }
+                        if chunk.done { break }
+                    }
+                    nextSynthesisIndex = end
+                }
+                guard token == playbackToken else { return }
+                readingTask = nil
+                if !audio.hasAudio { audioDrained() }
             } catch {
-                guard playbackToken == token, !Task.isCancelled else { return }
-                clips.removeValue(forKey: index)
-                self.error = error.localizedDescription
+                guard token == playbackToken, !Task.isCancelled else { return }
+                readingTask = nil
+                audio.pause()
                 busy = false
-                wantsPlayback = false
                 isPlaying = false
+                wantsPlayback = false
+                self.error = error.localizedDescription
                 status = "Playback needs attention"
             }
         }
     }
 
-    nonisolated func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
-        Task { @MainActor in
-            guard self.player === player else { return }
-            self.player = nil
-            isPlaying = false
-            guard flag else {
-                wantsPlayback = false
-                error = "Audio playback was interrupted. Press play to retry this sentence."
-                highlighter.hide(); wordHighlighter.hide()
-                return
-            }
-            if currentIndex + 1 < segments.count, wantsPlayback {
-                currentIndex += 1
-                playCurrent()
-            } else {
-                wantsPlayback = isFollowing
-                progress = 1
-                status = isFollowing ? "Waiting for new text…" : "All caught up"
-                highlighter.hide(); wordHighlighter.hide()
-                clips.removeAll()
-            }
+    private func audioDrained() {
+        isPlaying = false
+        highlighter.hide(); wordHighlighter.hide()
+        if readingTask != nil || nextSynthesisIndex < segments.count {
+            busy = wantsPlayback
+            status = wantsPlayback ? "Buffering audio…" : "Paused"
+            pumpAudio()
+        } else {
+            busy = false
+            progress = 1
+            if !segments.isEmpty { currentIndex = segments.count - 1 }
+            wantsPlayback = isFollowing && wantsPlayback
+            status = wantsPlayback ? "Waiting for new text…" : "All caught up"
         }
     }
 
@@ -379,11 +412,12 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             lastPermissionCheck = Date()
             refreshAccessibility()
         }
-        if let player, isPlaying, !segments.isEmpty {
-            progress = (Double(currentIndex) + player.currentTime / max(0.01, player.duration)) / Double(segments.count)
-        }
+        isPlaying = audio.isPlaying && wantsPlayback
         updateWordHighlight()
-        if isFollowing, wantsPlayback, followTask == nil, Date().timeIntervalSince(lastFollowPoll) >= 0.8 {
+        let followInterval = min(8.0, 0.8 * Double(max(1, followFailures)))
+        let queuedText = (document?.text.utf16.count ?? 0) - (current?.end ?? 0)
+        if isFollowing, wantsPlayback, followTask == nil, queuedText < 6000,
+           Date().timeIntervalSince(lastFollowPoll) >= followInterval {
             pollFollowing()
         }
         if Date().timeIntervalSince(lastHighlight) > 0.6 {
@@ -399,6 +433,8 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
         isFollowing = false
         pendingTail = ""
         followFailures = 0
+        if let followError, error == followError { error = nil }
+        followError = nil
         if !isPlaying && !busy && progress >= 1 {
             wantsPlayback = false
             status = "All caught up"
@@ -413,10 +449,12 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
             defer { if generation == token { followTask = nil } }
             do {
                 let snapshot = try await Task.detached(priority: .utility) {
-                    try sourceToFollow.snapshot(consumed: existing.text)
+                    try sourceToFollow.snapshot(consumed: existing.text, previousSpans: existing.spans)
                 }.value
                 guard generation == token, !Task.isCancelled, isFollowing else { return }
                 followFailures = 0
+                if let followError, error == followError { error = nil }
+                followError = nil
                 // Refresh AX elements too: streaming renderers often replace nodes.
                 document = CapturedDocument(text: existing.text, source: existing.source, pid: existing.pid,
                                             spans: snapshot.mappedSpans)
@@ -462,18 +500,20 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
                 segments.append(contentsOf: additions)
                 wordCount += additions.reduce(0) { $0 + ($1.words?.count ?? $1.text.split(separator: " ").count) }
                 pendingTail = ""
-                if !additions.isEmpty, wantsPlayback, player == nil, !busy {
-                    currentIndex = firstNewIndex
-                    playCurrent()
-                } else if !additions.isEmpty, segments.indices.contains(currentIndex + 1) {
-                    _ = clip(at: currentIndex + 1)
-                }
+                if !additions.isEmpty, wantsPlayback { pumpAudio() }
             } catch {
                 guard generation == token, !Task.isCancelled, isFollowing else { return }
-                followFailures += 1
-                if followFailures >= 3 {
+                if error is FollowCaptureError {
                     endFollowing()
                     self.error = error.localizedDescription
+                    return
+                }
+                followFailures += 1
+                if followFailures >= 3 {
+                    let notice = "Waiting to locate the text after your selection. Hush will keep trying; select a new passage if the page changed."
+                    followError = notice
+                    self.error = notice
+                    if !audio.hasAudio && readingTask == nil { status = "Waiting for the original text…" }
                 }
             }
         }
@@ -486,20 +526,36 @@ final class ReaderModel: NSObject, ObservableObject, AVAudioPlayerDelegate {
     }
 
     private func updateWordHighlight() {
-        guard highlightSource, isPlaying, let player, let current, let document,
-              let timing = wordTimings.first(where: { player.currentTime >= $0.start && player.currentTime < $0.end }),
-              let words = current.words, words.indices.contains(timing.index) else {
+        guard isPlaying, !playingWords.isEmpty else {
             wordHighlighter.hide()
             return
         }
-        let word = words[timing.index]
-        // Re-query while a word is active so scrolling and app switches are followed.
-        wordHighlighter.show(segment: ReadingSegment(id: timing.index, text: "", start: word.start,
-                                                     end: word.end, kind: "word"), document: document)
+        let time = audio.currentTime + 0.035
+        while wordCursor + 1 < playingWords.count, playingWords[wordCursor + 1].start <= time { wordCursor += 1 }
+        let spoken = playingWords[wordCursor]
+        guard segments.indices.contains(spoken.segment), let words = segments[spoken.segment].words,
+              words.indices.contains(spoken.word) else { return }
+        if currentIndex != spoken.segment {
+            currentIndex = spoken.segment
+            sourceHighlightChecked = false
+            updateHighlight()
+        }
+        let current = segments[spoken.segment]
+        let fraction = Double(words[spoken.word].end - current.start) / Double(max(1, current.end - current.start))
+        progress = min(0.99, (Double(currentIndex) + fraction) / Double(max(1, segments.count)))
+        guard highlightSource, let document else { wordHighlighter.hide(); return }
+        // Keep the previous/current/next word visible as one moving window.
+        // Hold it across short inter-word gaps instead of blinking it off.
+        let lower = max(0, spoken.word - 1), upper = min(words.count - 1, spoken.word + 1)
+        wordHighlighter.show(segment: ReadingSegment(id: currentIndex * 100_000 + spoken.word, text: "",
+                                                     start: words[lower].start, end: words[upper].end,
+                                                     kind: "word"), document: document)
     }
 
     func shutdown() {
         stop()
         timer?.invalidate()
+        audio.shutdown()
+        backend.reset()
     }
 }

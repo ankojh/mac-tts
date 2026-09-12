@@ -38,6 +38,20 @@ enum TextCapture {
         let deadline = Date().addingTimeInterval(1.5)
         for span in document.spans {
             if Date() > deadline { break }
+            // Wikipedia reference links can expose plain digits without their
+            // brackets or superscript attribute. Identify their actual target.
+            let reference = ancestors(span.element).prefix(5).contains { node in
+                let subrole = attribute(node, kAXSubroleAttribute) as? String ?? ""
+                if ["AXSuperscriptStyleGroup", "AXSubscriptStyleGroup"].contains(subrole) { return true }
+                let raw = attribute(node, kAXURLAttribute)
+                let address = (raw as? URL)?.absoluteString ?? (raw as? String) ?? ""
+                return address.contains("#cite_note") || address.contains("#cite_ref")
+            }
+            if reference {
+                output.replaceCharacters(in: NSRange(location: span.start, length: span.length),
+                                         with: String(repeating: " ", count: span.length))
+                continue
+            }
             var range = CFRange(location: span.elementOffset, length: span.length)
             guard let value = AXValueCreate(.cfRange, &range),
                   let attributed = parameter(span.element, kAXAttributedStringForRangeParameterizedAttribute, value) as? NSAttributedString,
@@ -107,12 +121,10 @@ enum TextCapture {
             let anchor = spans.first?.element ?? node
             let parents = ancestors(anchor)
             let web = parents.first(where: { attribute($0, kAXRoleAttribute) as? String == "AXWebArea" })
-            let article = parents.first(where: {
-                attribute($0, kAXRoleAttribute) as? String == "AXArticle" ||
-                attribute($0, kAXSubroleAttribute) as? String == "AXDocumentArticle"
-            })
             let main = parents.first(where: { attribute($0, kAXSubroleAttribute) as? String == "AXLandmarkMain" })
-            let sourceRoot = article ?? main ?? web ?? parents.first(where: {
+            // Continue into later paragraphs/messages in the same document,
+            // rather than stopping at the initially selected article/message.
+            let sourceRoot = main ?? web ?? parents.first(where: {
                 ["AXTextArea", "AXTextField"].contains(attribute($0, kAXRoleAttribute) as? String ?? "")
             }) ?? parents.first(where: { attribute($0, kAXRoleAttribute) as? String == "AXScrollArea" }) ?? node
             return CapturedDocument(text: text, source: name + " · selection", pid: pid, spans: spans,
@@ -150,25 +162,9 @@ enum TextCapture {
                 spans: [SourceSpan(start: 0, length: value.utf16.count, element: focused, elementOffset: 0, text: value)]))
         }
         if let web = nodes.first(where: { attribute($0, kAXRoleAttribute) as? String == "AXWebArea" }) {
-            nodes = readableNodes(web)
+            return try document(root: web, pid: pid, name: name + " · accessible text")
         }
-        var text = ""
-        var spans: [SourceSpan] = []
-        for node in nodes {
-            let role = attribute(node, kAXRoleAttribute) as? String ?? ""
-            guard ["AXStaticText", "AXTextArea", "AXHeading"].contains(role) else { continue }
-            guard let value = attribute(node, kAXValueAttribute) as? String, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
-            let start = text.utf16.count
-            guard start + value.utf16.count <= maxLength else {
-                throw HushError(message: "This document is too long. Select a smaller passage (up to 100,000 characters).")
-            }
-            spans.append(SourceSpan(start: start, length: value.utf16.count, element: node, elementOffset: 0, text: value))
-            text += value + "\n"
-        }
-        guard !text.isEmpty else {
-            throw HushError(message: "This app does not expose readable text. Copy a passage and choose Read clipboard.")
-        }
-        return CapturedDocument(text: text, source: name + " · accessible text", pid: pid, spans: spans)
+        return try document(root: root, pid: pid, name: name + " · accessible text")
     }
 
     static func readableNodes(_ root: AXUIElement) -> [AXUIElement] {

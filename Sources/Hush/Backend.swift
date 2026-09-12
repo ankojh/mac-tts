@@ -50,6 +50,16 @@ struct AudioClip: Decodable {
     let words: [WordTiming]?
 }
 
+struct PCMChunk: Decodable {
+    let pcm: String?
+    let rate: Int?
+    let duration: Double?
+    let words: [WordTiming]?
+    let done: Bool
+}
+
+struct WarmupStatus: Decodable { let ready: Bool }
+
 struct HushError: LocalizedError {
     let message: String
     var errorDescription: String? { message }
@@ -63,6 +73,16 @@ final class Backend {
     private var buffer = Data()
     private var pending: [String: CheckedContinuation<Data, Error>] = [:]
     private var timeouts: [String: Task<Void, Never>] = [:]
+
+    func cancelStream() {
+        // Ordered on the same pipe as stream_start. Keep the costly model loaded.
+        guard let input else { return }
+        let message = ["id": UUID().uuidString, "op": "stream_cancel"]
+        if var bytes = try? JSONSerialization.data(withJSONObject: message) {
+            bytes.append(10)
+            try? input.write(contentsOf: bytes)
+        }
+    }
 
     private func start() throws {
         if process?.isRunning == true { return }

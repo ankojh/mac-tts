@@ -165,7 +165,7 @@ struct PlayerView: View {
                 .help("Next sentence").accessibilityLabel("Next sentence")
             Spacer(minLength: 5)
             Menu {
-                ForEach([1.0, 1.1, 1.25, 1.5], id: \.self) { rate in
+                ForEach([1.0, 1.1, 1.25, 1.5, 1.75, 2.0], id: \.self) { rate in
                     Button { model.speed = rate } label: {
                         if model.speed == rate { Label(rateLabel(rate), systemImage: "checkmark") }
                         else { Text(rateLabel(rate)) }

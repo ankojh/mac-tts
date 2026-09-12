@@ -1,5 +1,6 @@
 import AppKit
 import ApplicationServices
+import QuartzCore
 
 enum HighlightGeometry {
     /// Adjacent word boxes on the same visual line become a single highlight.
@@ -157,7 +158,7 @@ final class SourceHighlighter {
         if inFlight && key == nextKey { return }
         if key == nextKey && Date().timeIntervalSince(lastQuery) < 0.18 { return }
         if key != nextKey {
-            panels.forEach { $0.orderOut(nil) }
+            if !isWord { panels.forEach { $0.orderOut(nil) } }
             revision = UUID()
             key = nextKey
         }
@@ -195,8 +196,16 @@ final class SourceHighlighter {
                 panel.setAccessibilityElement(false)
                 panels.append(panel)
             }
-            panels[index].setFrame(rect.insetBy(dx: -3, dy: -2), display: true)
-            panels[index].orderFrontRegardless()
+            let panel = panels[index]
+            let next = rect.insetBy(dx: -3, dy: -2)
+            if isWord, panel.isVisible, abs(panel.frame.midY - next.midY) < max(panel.frame.height, next.height) {
+                NSAnimationContext.runAnimationGroup { context in
+                    context.duration = 0.10
+                    context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+                    panel.animator().setFrame(next, display: true)
+                }
+            } else { panel.setFrame(next, display: true) }
+            if !panel.isVisible { panel.orderFrontRegardless() }
         }
         for index in min(rects.count, panels.count)..<panels.count { panels[index].orderOut(nil) }
         onAvailability?(!rects.isEmpty)

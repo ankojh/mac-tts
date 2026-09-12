@@ -21,6 +21,30 @@ VOICES = [
 class Engine:
     def __init__(self):
         self.model = None
+        self.stream = None
+
+    def start_stream(self, text, voice_id):
+        if not isinstance(text, str) or not text.strip() or len(text) > 4000:
+            raise ValueError("Streaming passages must contain 1–4,000 characters.")
+        voice = next((v for v in VOICES if v["id"] == voice_id), None)
+        if voice is None:
+            raise ValueError("Choose one of the available voices.")
+        self.load()
+        from .streaming import stream
+        self.stream = stream(self.model, text, voice_id, voice["lang"])
+        return self.next_stream()
+
+    def next_stream(self):
+        if self.stream is None:
+            return {"done": True}
+        try:
+            result = next(self.stream)
+            if result["done"]:
+                self.stream = None
+            return result
+        except StopIteration:
+            self.stream = None
+            return {"done": True}
 
     def load(self):
         if self.model is not None:
